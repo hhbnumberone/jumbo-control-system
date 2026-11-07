@@ -1,0 +1,98 @@
+// ============================================================================
+// FB_AxisPos.scl —— 单关节定位闭环 FB（S7-1500 SCL / 阶段0c）
+// ----------------------------------------------------------------------------
+// 与 Python 验证版 src/hydraulic_sim.py::FB_AxisPos 算法一致（软件在环已验证）：
+//   阶跃 0.03° / 超调 0% / 整定 1.1s；跟踪峰值 0.093°，终态 0.028°（2026-11-03）
+// 架构要点（调试教训，勿改回）：
+//   1. 斜坡限幅在【关节空间】做（设计速度是关节量；行程当量非线性 ±20%）；
+//   2. 速度前馈 = 转换后行程给定的差分（自动含局部当量）；
+//   3. 死区补偿用叠加式（u += dz），带内不补偿；替换式补偿会产生最低速度。
+// 调用：在循环中断 OB（10ms）中调用；每轴一个实例。
+// 依赖：FC_CalInterp（标定表插值，见 FC_CalInterp.scl）+ 标定 DB。
+// ============================================================================
+FUNCTION_BLOCK "FB_AxisPos"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+   VAR_INPUT
+      target     : REAL;   // 目标（关节空间：rad 或 m，与标定表同单位）
+      actStroke  : REAL;   // 行程反馈（m，来自编码器/位移计经标定零点）
+      enable     : BOOL;   // 使能（急停/联锁断开时 FALSE）
+   END_VAR
+
+   VAR_OUTPUT
+      u          : REAL;   // 阀给定 -10..+10 V → AO 模块
+      done       : BOOL;   // 到位（连续 nStable 周期在带宽内）
+      alarm      : BOOL;   // 30s 超时未到位
+   END_VAR
+
+   VAR_STAT                 // 轴参数（整定值，源自 Python 半仿真首轮）
+      kp         : REAL := 120.0;    // P 增益 V/m（行程误差）
+      vRamp      : REAL := 0.2094;   // 关节斜坡限速 rad/s（=12°/s；P 轴用 m/s）
+      tol        : REAL := 5.236e-4; // 到位带宽 rad（=0.03°）
+      kVff       : REAL := 24.4;     // 速度前馈 V·s/m = 10/满开比速（台架重标）
+      dzComp     : REAL := 0.5;      // 死区补偿偏置 V（与阀实测死区一致）
+      uLim       : REAL := 10.0;
+      nStable    : INT  := 20;       // 连续 200ms 在带内 → done
+      tCycle     : REAL := 0.01;     // 调用周期 10ms
+   END_VAR
+
+   VAR                      // 内部状态
+      ramp       : REAL;   // 关节空间斜坡给定
+      sPrev      : REAL;   // 上周期行程给定（前馈差分）
+      stableCnt  : INT;
+      t          : REAL;
+      firstScan  : BOOL := TRUE;
+      sT         : REAL;   // 本周期行程给定
+      vInst      : REAL;   // 行程给定速度 m/s
+      actQ       : REAL;   // 行程反馈反算的关节角
+   END_VAR
+
+BEGIN
+   IF NOT enable THEN
+      u := 0.0;  done := FALSE;  alarm := FALSE;
+      stableCnt := 0;  t := 0.0;  firstScan := TRUE;
+      RETURN;
+   END_IF;
+
+   t := t + tCycle;
+
+   IF firstScan THEN                     // 上电/换孔：斜坡对齐目标，防冲刺
+      ramp := target;
+      sPrev := Q2S(ramp);
+      firstScan := FALSE;
+   END_IF;
+
+   // 1) 关节空间斜坡限幅（教训：不要在行程空间限速）
+   IF target - ramp > vRamp * tCycle THEN
+      ramp := ramp + vRamp * tCycle;
+   ELSIF ramp - target > vRamp * tCycle THEN
+      ramp := ramp - vRamp * tCycle;
+   ELSE
+      ramp := target;
+   END_IF;
+
+   // 2) 标定表转换 → 行程给定；前馈 = 转换后差分（自动含局部当量）
+   sT    := Q2S(ramp);
+   vInst := (sT - sPrev) / tCycle;
+   sPrev := sT;
+
+   // 3) 行程误差 + 速度前馈 + P
+   u := kVff * vInst + kp * (sT - actStroke);
+
+   // 4) 叠加式死区补偿（带内不补偿，防稳态爬行）
+   actQ := S2Q(actStroke);
+   IF (u <> 0.0) AND (ABS(target - actQ) > tol) THEN
+      IF u > 0.0 THEN u := u + dzComp; ELSE u := u - dzComp; END_IF;
+   END_IF;
+   u := LIMIT(-uLim, u, uLim);
+
+   // 5) 到位判断（关节带宽）+ 超时报警
+   IF ABS(target - actQ) < tol THEN
+      stableCnt := stableCnt + 1;
+   ELSE
+      stableCnt := 0;
+   END_IF;
+   done  := stableCnt >= nStable;
+   alarm := (t > 30.0) AND (NOT done);
+END_FUNCTION_BLOCK

@@ -1,0 +1,47 @@
+// ============================================================================
+// FC_CalInterp.scl —— 关节↔油缸行程 标定表插值（阶段0c）
+// ----------------------------------------------------------------------------
+// 标定表来源：src/cylinder_mapping.py::calibrate()（几何解算 60 点）；
+// 实机阶段以实测 ≥5 点重新拟合并更新 DB（吸收制造/安装误差）。
+// 验收：表格线性插值往返误差 <0.01°（几何表实测 0.0000°）。
+// 铰点教训（勿忘）：
+//   * 双缸并排布置（垂直于机构平面），两缸行程相同——不是平面镜像；
+//   * 关节跨度 >180°窗（如梁俯仰±100°）直驱必然非单调，须四连杆放大
+//     （lever_k=2：油缸驱动曲柄 φ=θ/2，标定表按最终关节角生成，此细节被吸收）。
+// ============================================================================
+FUNCTION "FC_CalInterp" : REAL
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   // 关节角 → 油缸行程（线性插值）。反算 S2Q 用对应反向表调用本 FC 即可。
+   VAR_INPUT
+      q      : REAL;             // 关节角（rad 或 m）
+      qTab   : ARRAY[0..59] OF REAL;  // 标定表：关节角（升序）
+      sTab   : ARRAY[0..59] OF REAL;  // 标定表：行程（m）
+   END_VAR
+
+   VAR_TEMP
+      i      : INT;
+      k      : REAL;
+   END_VAR
+
+BEGIN
+   // 越界钳位
+   IF q <= qTab[0] THEN
+      FC_CalInterp := sTab[0];
+      RETURN;
+   ELSIF q >= qTab[59] THEN
+      FC_CalInterp := sTab[59];
+      RETURN;
+   END_IF;
+
+   // 找段（60 点顺序查找足够；如需更快可改二分）
+   FOR i := 1 TO 59 DO
+      IF q <= qTab[i] THEN
+         k := (q - qTab[i-1]) / (qTab[i] - qTab[i-1]);
+         FC_CalInterp := sTab[i-1] + k * (sTab[i] - sTab[i-1]);
+         RETURN;
+      END_IF;
+   END_FOR;
+
+   FC_CalInterp := sTab[59];
+END_FUNCTION

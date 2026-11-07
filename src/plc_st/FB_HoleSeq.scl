@@ -1,0 +1,107 @@
+// ============================================================================
+// FB_HoleSeq.scl —— 自动寻孔流程状态机（阶段0c，对应总体设计 §8）
+// ----------------------------------------------------------------------------
+// S0 待机 → S1x 取孔/解算 → S2x 定位 → S30 补偿顶紧 → S40 开孔 → S50 钻进采样
+//        → S60 终孔退钎 → S70 下一孔 → S90 组包上传 → S99 故障
+// 数据采集点已标注（对应接口规定字段）：状态机的每步输出就是平台要的数据。
+// 10ms 周期调用；与 4 个 FB_AxisPos 实例配合。
+// 说明：S40/S50 的钻进闭环（推进压力/防卡钎）V0.2 只做监测位，自动干预 V0.3。
+// ============================================================================
+FUNCTION_BLOCK "FB_HoleSeq"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+   VAR_INPUT
+      cmdStart    : BOOL;       // HMI：开始本循环
+      ikValid     : BOOL;       // 工控机：第 i 孔 IK 解有效（DB_HoleCmd 已更新）
+      holeAllDone : BOOL;       // 工控机：孔表全部完成
+      compPressOK : BOOL;       // 补偿缸压力开关+行程双确认
+      drillDone   : BOOL;       // 工控机/PLC：孔深到位（推进位移计判据）
+      uploadDone  : BOOL;       // 工控机：成果已上传 CRBIMS
+      estop       : BOOL;       // 急停（硬线同时切断阀电源，此处做状态记录）
+   END_VAR
+
+   VAR_OUTPUT
+      step        : INT;        // 当前状态（HMI 显示）
+      posEnable   : BOOL;       // 给 4 个 FB_AxisPos 的 enable
+      compCmd     : BOOL;       // 补偿缸电磁阀（顶紧/释放）
+      drillPermit : BOOL;       // 允许凿岩机开孔（联锁汇总）
+      cycleDone   : BOOL;       // 整循环完成
+   END_VAR
+
+   VAR
+      holeIdx     : INT;        // 当前孔序号
+      timeout     : REAL;
+      sDone1      : BOOL;  sDone2 : BOOL;  sDone3 : BOOL;  sDone4 : BOOL;
+   END_VAR
+
+BEGIN
+   IF estop THEN
+      step := 99;
+   END_IF;
+
+   CASE step OF
+      0:  // 待机：清输出，等启动
+         posEnable := FALSE; compCmd := FALSE; drillPermit := FALSE;
+         cycleDone := FALSE; holeIdx := 0;
+         IF cmdStart THEN step := 10; END_IF;
+
+      10: // 请求第 holeIdx 孔解算（工控机经通讯写 DB_HoleCmd）
+         posEnable := FALSE;
+         IF holeAllDone THEN
+            step := 90;
+         ELSIF ikValid THEN
+            timeout := 0.0;
+            step := 20;
+         END_IF;
+
+      20: // 多关节定位：4 轴 FB_AxisPos 同时运行（实例在调用处）
+         posEnable := TRUE;
+         IF sDone1 AND sDone2 AND sDone3 AND sDone4 THEN
+            posEnable := FALSE;
+            timeout := 0.0;
+            step := 30;
+         ELSE
+            timeout := timeout + 0.01;
+            IF timeout > 60.0 THEN step := 99; END_IF;  // 定位超时→故障
+         END_IF;
+
+      30: // 补偿顶紧：压力到位（压力开关+行程双确认）
+         compCmd := TRUE;
+         IF compPressOK THEN
+            drillPermit := TRUE;      // ★联锁：未顶紧禁止开孔（§7.4-3）
+            timeout := 0.0;
+            step := 40;
+         ELSE
+            timeout := timeout + 0.01;
+            IF timeout > 10.0 THEN step := 99; END_IF;
+         END_IF;
+
+      40: // 开孔：低速低推 5cm（钻进闭环 V0.2 由工控机监管）
+         drillPermit := TRUE;
+         // 开孔完成由钻进子系统置 drillPhase → 50；此处简化为直接转钻进
+         step := 50;
+
+      50: // 正常钻进：过程采样由工控机按接口规定执行
+         //   （每50cm一点；末段20cm内每5cm；终孔必采 → holesjdata/表3-2-1-3）
+         IF drillDone THEN
+            drillPermit := FALSE;
+            step := 60;
+         END_IF;
+
+      60: // 终孔退钎 + 补偿释放；记录成果（holesjdata：时间/终深/boomId/坐标）
+         compCmd := FALSE;
+         step := 70;
+
+      70: // 下一孔
+         holeIdx := holeIdx + 1;
+         step := 10;
+
+      90: // 循环完成：工控机组包上传（CRBIMSSOJWT + 表3-2-1）
+         cycleDone := TRUE;
+         IF uploadDone THEN step := 0; END_IF;
+
+      99: // 故障/急停：断使能、收补偿，等 HMI 复位（记录断点，恢复从断点续）
+         posEnable := FALSE; drillPermit := FALSE; compCmd := FALSE;
+   END_CASE;
+END_FUNCTION_BLOCK
